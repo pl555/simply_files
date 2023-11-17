@@ -1,0 +1,133 @@
+sequenceDiagram
+    title Логика работы дефиниции registerClientsMergeEvent
+    participant M as Merger<br/>System
+    participant PL as Platformeco<br/> ClientID
+    participant PS as Postgres<br/> ClientID
+    participant OS as Open<br/> Search
+    participant K as Kafka
+    autonumber
+
+    activate M
+    M->>+PL: Вызов registerClientsMergeEvent:<br/>/v1/clients/merge-register
+
+    Note over M, PS: Выполняем проверки переданных идентификаторов МК и СК
+
+    alt Идентификатор МК передан как oracle_id
+        PL->>+PS: SELECT: проверить наличие записи<br/> о МК в таблице dit
+        PS-->>-PL: Результат запроса:<br/> возврат uuid записи<br/> либо пустой ответ
+
+        break Запись по oracle_id не найдена в dit
+            PL-->>-M: HTTP 404 [Not Found],<br/> {Message: Не найдена Мастер-карточка<br/> с указанным oracle_id}
+            deactivate M
+        end
+
+    activate M
+    activate PL        
+
+    else Идентификатор МК передан как uuid Flora
+        PL->>+PS: SELECT: проверить наличие записи<br/> о МК в таблице poodb
+        PS-->>-PL: Результат запроса:<br/> запсиь найдена либо нет
+
+        break Запись по uuid не найдена в poodb
+            PL-->>-M: HTTP 404 [Not Found],<br/> {Message: Не найдена Мастер-карточка<br/> с указанным uuid}
+            deactivate M
+        end
+
+        activate M
+        activate PL
+    end
+
+    alt Идентификаторы СК переданы как oracle_id
+        loop для каждой СК из переданного массива
+            PL->>+PS: SELECT: проверить наличие записи<br/> об СК в таблице dit
+            PS-->>-PL: Результат запроса:<br/> возврат uuid записи<br/> либо пустой ответ
+
+            break Запись по oracle_id не найдена в dit
+                PL-->>-M: HTTP 404 [Not Found],<br/> {Message: Не найдена сливаемая карточка<br/> с oracle_id: $orale_id}
+                deactivate M
+            end
+
+            activate M
+            activate PL
+        end
+
+    else Идентификатор МК передан как uuid Flora
+        loop для каждой СК из переданного массива
+            PL->>+PS: SELECT: проверить наличие записи<br/> об СК в таблице poodb
+            PS-->>-PL: Результат запроса:<br/> запсиь найдена либо нет
+
+            break Запись по uuid не найдена в poodb
+                PL-->>-M: HTTP 404 [Not Found],<br/> {Message: Не найдена сливаемая карточка <br/> с uuid: $uuid}
+                deactivate M
+            end
+
+            activate M
+            activate PL
+        end
+    end
+
+    Note over M, PS: После выполнения проверок выше гарантировано имеем uuid переданных МК и СК
+
+    PL->>+PS: SELECT: получить список<br/> каналов и методов для опроса<br/> из таблицы table_2
+    PS-->>-PL: Актуальный список каналов
+
+    break Получена ошибка БД
+        PL-->>-M: HTTP 500 [Internal Server Error],<br/> {Message: Ошибка при получении<br/> из БД списка каналов}
+        deactivate M
+    end
+
+    activate M
+    activate PL
+
+    PL->>PL: Сгенерировать uuid События,<br/> зафиксировать дату-время События
+    PL->>+PS: BEGIN: Открыть транзакцию
+
+    loop для каждой СК из переданного массива
+        par
+            PL->>+PL: Вызов getAllClientDataForInfomodel:<br/> собрать ИМ СК
+            PL-->>-PL:Возврат ИМ СК
+            PL->>+PS: INSERT: Записать собраную<br/> ИМ СК в table_4 
+            PS-->>-PL: Результат записи
+
+        and
+            PL->>+PS: INSERT: Создать запись о<br/> Событии + СК в таблицу table_1
+            PS-->>-PL: Возврат созданной записи
+
+        and
+            PL->>+PS: Серия DELETE: удалить СК<br/> и все ее Подсущности из БД
+            PS-->>-PL: Результат серии удалений
+
+        and
+            PL->>+OS: Удалить СК из индекса ClientID:<br/> DELETE /{clientId_index}/_doc/{client_uuid}
+            OS-->>-PL: Результат удаления СК из индекса
+        end
+
+        break Получена ошибка на любом из шагов внтури loop
+            PL->>PS: ROLLBACK: откатить транзакцию
+            PS-->>-PL: Транзакция отменена
+            PL-->>-M: HTTP 500 [Internal Server Error],<br/> Возврат сообщения об ошибке.
+            deactivate M
+        end
+
+        activate M
+        activate PL
+        activate PS
+    end
+
+    PL->>PL: Собрать объект event выходных данных<br/> для записи в Kafka
+    PL->>+K: Отправить сообщение о Событии:<br/> JSON объекта event 
+    K-->>-PL: Результат записи сообщения
+
+    break Ошибка при попытке записи в Kafka
+        PL->>+PS: ROLLBACK: откатить транзакцию
+        PS-->>-PL: Транзакция отменена
+        PL-->>-M: HTTP 500 [Internal Server Error],<br/> {Message: Не удалось записать<br/> собщение о Событии в Kafka.
+        deactivate M
+    end
+
+    activate M
+    activate PL
+    PL->>PS: COMMIT: подтвердить транзакцию
+    PS-->>-PL: Транзакция подтверждена,<br/> изменения применены
+    PL-->>-M: HTTP 201 [Created],<br/> {JSON: объект event с данными<br/> о созданном Событии}
+    deactivate M
